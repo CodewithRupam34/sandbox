@@ -351,6 +351,13 @@ function broadcastToOthers(room: CollabRoom, senderClientId: string, msg: object
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '512kb' }));
+  app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+    if (err && typeof err === 'object' && 'status' in err) {
+      res.status(400).json({ error: 'Invalid JSON request payload.' });
+      return;
+    }
+    next(err);
+  });
 
   // Auth routes
   app.post('/api/auth/register', (req: Request, res: Response) => {
@@ -724,6 +731,9 @@ Guidelines:
     }
   });
 
+  // In-memory TTS cache to avoid repeating requests against daily free-tier limits
+  const ttsCache = new Map<string, { audioBase64: string; mimeType: string; voiceUsed: string }>();
+
   // Gemini TTS endpoint (Indian English accent + Pegasus voice)
   app.post('/api/tts', async (req: Request, res: Response) => {
     const rawText = typeof req.body?.text === 'string' ? req.body.text : '';
@@ -738,6 +748,13 @@ Guidelines:
 
     if (!cleanText) {
       res.status(400).json({ error: 'Text is required for speech synthesis.' });
+      return;
+    }
+
+    const ttsCacheKey = `${preferredLanguage}::${cleanText}`;
+    const cachedTts = ttsCache.get(ttsCacheKey);
+    if (cachedTts) {
+      res.json(cachedTts);
       return;
     }
 
@@ -764,9 +781,9 @@ Guidelines:
         ? 'Speak in a warm, clear Indian English accent like a helpful Python tutor.'
         : `Speak clearly in a warm Indian accent suited for language code ${preferredLanguage}.`;
 
-    const synthesizeWithVoice = (voiceName: string) =>
+    const synthesizeWithVoice = (model: 'gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts', voiceName: string) =>
       ai.models.generateContent({
-        model: 'gemini-3.8-flash-lite-tts',
+        model,
         contents: [
           {
             role: 'user',
@@ -794,33 +811,70 @@ Guidelines:
       let voiceUsed = 'Pegasus';
       let response;
       try {
-        response = await synthesizeWithVoice('Pegasus');
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : '';
-        // If Pegasus isn't recognized on this endpoint version, fall back to Puck with the same Indian accent style
-        if (msg.toLowerCase().includes('voice') || msg.includes('400')) {
-          voiceUsed = 'Puck';
-          response = await synthesizeWithVoice('Puck');
+        response = await synthesizeWithVoice('gemini-3.8-flash-lite-tts', 'Pegasus');
+      } catch (primaryErr) {
+        const primaryMsg = primaryErr instanceof Error ? primaryErr.message : '';
+        const lowerMsg = primaryMsg.toLowerCase();
+        if (lowerMsg.includes('429') || lowerMsg.includes('quota') || lowerMsg.includes('resource_exhausted')) {
+          // Try flash-tts model if flash-lite-tts daily free quota is exhausted
+          voiceUsed = 'Kore';
+          response = await synthesizeWithVoice('gemini-3.8-flash-tts', 'Kore');
+        } else if (lowerMsg.includes('voice') || primaryMsg.includes('400') || lowerMsg.includes('invalid')) {
+          voiceUsed = 'Kore';
+          response = await synthesizeWithVoice('gemini-3.8-flash-lite-tts', 'Kore');
         } else {
-          throw err;
+          throw primaryErr;
         }
       }
 
-      const audioBase64 =
-        response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      const audioPart = response.candidates?.[0]?.content?.parts?.find(
+        (part) => Boolean(part.inlineData?.data)
+      );
+      const audioBase64 = audioPart?.inlineData?.data;
+      const mimeType = audioPart?.inlineData?.mimeType || 'audio/wav';
       if (!audioBase64) {
-        res.status(502).json({ error: 'Voice generator returned empty audio.' });
+        res.status(503).json({ error: 'Voice generator returned empty audio.' });
         return;
       }
 
-      res.json({
-        audioBase64,
-        mimeType: 'audio/wav',
-        voiceUsed,
-      });
+      const payload = { audioBase64, mimeType, voiceUsed };
+      if (ttsCache.size > 60) {
+        const firstKey = ttsCache.keys().next().value;
+        if (firstKey) ttsCache.delete(firstKey);
+      }
+      ttsCache.set(ttsCacheKey, payload);
+
+      res.json(payload);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Unable to generate voice audio.';
-      res.status(502).json({ error: msg });
+      let msg = err instanceof Error ? err.message : 'Unable to generate voice audio.';
+      let statusCode = 500;
+      try {
+        const parsed = JSON.parse(msg) as { error?: { code?: number; message?: string; status?: string } };
+        if (parsed?.error?.message) {
+          msg = parsed.error.message;
+        }
+        if (typeof parsed?.error?.code === 'number') {
+          statusCode = parsed.error.code;
+        }
+      } catch {
+        // Keep string message as-is when not JSON
+      }
+      const lower = msg.toLowerCase();
+      if (lower.includes('quota') || lower.includes('resource_exhausted') || statusCode === 429) {
+        res.status(429).json({
+          error: 'Daily free Gemini voice quota reached — using built-in device voice.',
+        });
+        return;
+      }
+      if (statusCode === 403 || lower.includes('permission_denied') || lower.includes('api_key_invalid')) {
+        res.status(403).json({
+          error: 'Check your Gemini API key in Settings > Secrets for studio voice narration.',
+        });
+        return;
+      }
+      res.status(statusCode >= 400 && statusCode < 500 ? statusCode : 503).json({
+        error: msg,
+      });
     }
   });
 

@@ -61,6 +61,11 @@ export const AnimatedLessonMode: React.FC<AnimatedLessonModeProps> = ({
   const [replayNonce, setReplayNonce] = useState<number>(0);
 
   const fallbackTimerRef = useRef<number | null>(null);
+  const selectedOptionRef = useRef<number | null>(selectedOption);
+  selectedOptionRef.current = selectedOption;
+  const onCompleteVideoRef = useRef(onCompleteVideo);
+  onCompleteVideoRef.current = onCompleteVideo;
+
   const stage: AnimatedStage = stages[stageIndex] ?? stages[0];
   const checkpoint = stage.checkpoint;
   const checkpointSolved =
@@ -135,19 +140,21 @@ export const AnimatedLessonMode: React.FC<AnimatedLessonModeProps> = ({
     };
   }, [stage.id, stage.animationKind, stage.items, replayNonce]);
 
-  // Play Gemini Pegasus Indian-accent narration when isPlaying is true
+  // Play Gemini voice narration (with smooth timed/browser fallback so video never stalls)
   useEffect(() => {
     stopAudioAndTimers();
     if (!isPlaying) return;
 
     let cancelled = false;
     const current = stages[stageIndex] ?? stages[0];
-    const hasUnsolvedCheckpoint =
-      Boolean(current.checkpoint) && selectedOption !== current.checkpoint?.correctIndex;
 
     const handleFinishNarration = () => {
       if (cancelled) return;
       setVoiceState('idle');
+      const hasUnsolvedCheckpoint =
+        Boolean(current.checkpoint) &&
+        selectedOptionRef.current !== current.checkpoint?.correctIndex;
+
       // Automatically STOP at checkpoints for the questions!
       if (hasUnsolvedCheckpoint) {
         setIsPlaying(false);
@@ -162,8 +169,65 @@ export const AnimatedLessonMode: React.FC<AnimatedLessonModeProps> = ({
       } else {
         setIsPlaying(false);
         setCompletedTrackIds((prev) => (prev.includes(activeTrack.id) ? prev : [...prev, activeTrack.id]));
-        onCompleteVideo?.(activeTrack.title, activeTrack.id);
+        onCompleteVideoRef.current?.(activeTrack.title, activeTrack.id);
       }
+    };
+
+    const startVisualOrBrowserSpeechFallback = (note?: string) => {
+      if (cancelled) return;
+      if (note) {
+        setVoiceError(note);
+      }
+      const estimatedMs = Math.max(
+        4800,
+        Math.min(14000, Math.round((current.spokenScript.split(/\s+/).length / Math.max(0.6, speechRate)) * 460))
+      );
+      if (
+        !audioMuted &&
+        typeof window !== 'undefined' &&
+        'speechSynthesis' in window &&
+        typeof SpeechSynthesisUtterance !== 'undefined'
+      ) {
+        try {
+          window.speechSynthesis.cancel();
+          const utter = new SpeechSynthesisUtterance(current.spokenScript);
+          const voices = window.speechSynthesis.getVoices?.() ?? [];
+          const indianOrEnglishVoice =
+            voices.find((v) => v.lang.toLowerCase().includes('en-in')) ??
+            voices.find((v) => v.lang.toLowerCase().startsWith('en'));
+          if (indianOrEnglishVoice) {
+            utter.voice = indianOrEnglishVoice;
+          }
+          utter.rate = speechRate;
+          let finished = false;
+          const finishOnce = () => {
+            if (finished || cancelled) return;
+            finished = true;
+            if (fallbackTimerRef.current !== null) {
+              window.clearTimeout(fallbackTimerRef.current);
+              fallbackTimerRef.current = null;
+            }
+            handleFinishNarration();
+          };
+          utter.onstart = () => {
+            if (!cancelled) setVoiceState('speaking');
+          };
+          utter.onend = finishOnce;
+          utter.onerror = () => {
+            if (!cancelled) {
+              setVoiceState('idle');
+            }
+          };
+          // Safety guard so video never stalls if browser speechSynthesis drops onend
+          fallbackTimerRef.current = window.setTimeout(finishOnce, estimatedMs + 1800);
+          window.speechSynthesis.speak(utter);
+          return;
+        } catch {
+          // Fall through to timed scene advance
+        }
+      }
+      setVoiceState('idle');
+      fallbackTimerRef.current = window.setTimeout(handleFinishNarration, estimatedMs);
     };
 
     if (!audioMuted) {
@@ -180,11 +244,7 @@ export const AnimatedLessonMode: React.FC<AnimatedLessonModeProps> = ({
           handleFinishNarration();
         },
         onError: (msg) => {
-          if (!cancelled) {
-            setVoiceState('idle');
-            setIsPlaying(false);
-            setVoiceError(msg);
-          }
+          startVisualOrBrowserSpeechFallback(msg);
         },
       });
     } else {
@@ -201,10 +261,11 @@ export const AnimatedLessonMode: React.FC<AnimatedLessonModeProps> = ({
     isPlaying,
     stageIndex,
     stages,
+    activeTrack.id,
+    activeTrack.title,
     audioMuted,
     speechRate,
     preferredLanguage,
-    selectedOption,
     stopAudioAndTimers,
   ]);
 
@@ -468,8 +529,15 @@ export const AnimatedLessonMode: React.FC<AnimatedLessonModeProps> = ({
           </div>
 
           {voiceError && (
-            <div className="relative z-10 rounded-2xl border border-rose-400/50 bg-rose-950/70 px-4 py-3 text-xs font-bold text-rose-200">
-              {voiceError}
+            <div className="relative z-10 flex items-center justify-between gap-3 rounded-2xl border border-amber-300/35 bg-amber-950/45 px-4 py-2.5 text-xs font-semibold text-amber-100">
+              <span>{voiceError}</span>
+              <button
+                type="button"
+                onClick={() => setVoiceError(null)}
+                className="shrink-0 rounded-lg bg-white/10 px-2.5 py-1 text-[11px] font-bold text-amber-200 hover:bg-white/20"
+              >
+                Dismiss
+              </button>
             </div>
           )}
 

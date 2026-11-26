@@ -13,6 +13,16 @@ const audioCache = new Map<string, string>();
 let activeAudio: HTMLAudioElement | null = null;
 let activeAbortController: AbortController | null = null;
 
+function base64ToBlobUrl(base64: string, mimeType: string): string {
+  const binary = window.atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  const blob = new Blob([bytes], { type: mimeType });
+  return URL.createObjectURL(blob);
+}
+
 export function stopGeminiVoice(): void {
   if (activeAbortController) {
     activeAbortController.abort();
@@ -22,6 +32,13 @@ export function stopGeminiVoice(): void {
     activeAudio.pause();
     activeAudio.src = '';
     activeAudio = null;
+  }
+  if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+    try {
+      window.speechSynthesis.cancel();
+    } catch {
+      // Ignore browser speech cleanup failures
+    }
   }
 }
 
@@ -40,8 +57,8 @@ export async function playGeminiVoice({
   activeAbortController = controller;
 
   try {
-    let dataUrl = audioCache.get(cacheKey);
-    if (!dataUrl) {
+    let audioUrl = audioCache.get(cacheKey);
+    if (!audioUrl) {
       const res = await fetch('/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -49,28 +66,52 @@ export async function playGeminiVoice({
         signal: controller.signal,
       });
 
-      const data = (await res.json()) as {
+      const rawBody = await res.text();
+      let data: {
         audioBase64?: string;
         mimeType?: string;
         error?: string;
-      };
+      } = {};
+
+      if (rawBody) {
+        try {
+          data = JSON.parse(rawBody) as {
+            audioBase64?: string;
+            mimeType?: string;
+            error?: string;
+          };
+        } catch {
+          onError?.(
+            res.status === 429
+              ? 'Daily free Gemini voice quota reached — using device voice.'
+              : 'Using built-in device voice while studio voice service is busy.'
+          );
+          return;
+        }
+      }
 
       if (!res.ok || !data.audioBase64) {
-        onError?.(data.error ?? 'Unable to generate Pegasus voice audio.');
+        onError?.(data.error ?? 'Unable to generate voice audio right now.');
         return;
       }
 
-      dataUrl = `data:${data.mimeType ?? 'audio/wav'};base64,${data.audioBase64}`;
+      audioUrl = base64ToBlobUrl(data.audioBase64, data.mimeType ?? 'audio/wav');
       if (audioCache.size > 40) {
         const firstKey = audioCache.keys().next().value;
-        if (firstKey) audioCache.delete(firstKey);
+        if (firstKey) {
+          const evictedUrl = audioCache.get(firstKey);
+          audioCache.delete(firstKey);
+          if (evictedUrl && evictedUrl.startsWith('blob:')) {
+            URL.revokeObjectURL(evictedUrl);
+          }
+        }
       }
-      audioCache.set(cacheKey, dataUrl);
+      audioCache.set(cacheKey, audioUrl);
     }
 
     if (controller.signal.aborted) return;
 
-    const audio = new Audio(dataUrl);
+    const audio = new Audio(audioUrl);
     audio.playbackRate = playbackRate;
     activeAudio = audio;
 

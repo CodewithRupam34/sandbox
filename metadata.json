@@ -1,0 +1,6 @@
+{
+  "name": "PyConcept",
+  "description": "Interactive Python learning platform with visual theory, animated lessons, adaptive quizzes, code continuation challenges, and a live Python playground.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
